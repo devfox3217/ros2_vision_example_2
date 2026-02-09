@@ -19,7 +19,9 @@ class VideoPublisher(Node):
         
         # 비디오 파일 경로 (프로젝트 내 sample 폴더)
         # 실제 환경에 맞게 경로를 수정하거나 파라미터로 받을 수 있습니다.
-        self.video_path = 'D:/Projects/ros2_vision_example_2/sample/camera_open.mp4'
+        # 현재 실행 위치가 프로젝트 루트라고 가정하거나 절대 경로 사용
+        # Ubuntu 환경에 맞게 경로 수정
+        self.video_path = '/home/ubuntu/IdeaProjects/ros2_vision_example_2/sample/camera_open.mp4'
         
         self.cap = cv2.VideoCapture(self.video_path)
         

@@ -1,16 +1,11 @@
-import sys
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from lane_msgs.msg import LaneParams
+from lane_msgs.msg import LaneParams, LaneData
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
-from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QLabel, QSlider, QGroupBox, QGridLayout)
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
-from PyQt5.QtGui import QImage, QPixmap
-from threading import Thread
+import math
 
 class GUINode(Node):
     def __init__(self):
@@ -21,6 +16,9 @@ class GUINode(Node):
         self.sub_debug = self.create_subscription(Image, '/lane_debug_img', self.debug_callback, 10)
         self.sub_visual = self.create_subscription(Image, '/lane_visual', self.visual_callback, 10)
         
+        # Lane Data Subscriber (For Angle Display)
+        self.sub_lane_data = self.create_subscription(LaneData, '/lane_data', self.lane_data_callback, 10)
+        
         # Publisher (Parameter Control)
         self.pub_params = self.create_publisher(LaneParams, '/lane_params', 10)
         
@@ -30,19 +28,70 @@ class GUINode(Node):
         self.img_camera = None
         self.img_debug = None
         self.img_visual = None
+        self.current_lane_data = None
         
-        # Default Params
+        # Default Params (Matched with lane_processor.py)
+        self.default_params = {
+            'h_min': 0, 'h_max': 180,
+            's_min': 0, 's_max': 50,
+            'v_min': 180, 'v_max': 255,
+            'canny_low': 80, 'canny_high': 200,
+            'roi_height_percent': 70, 'warp_offset': 200
+        }
+        
         self.params = LaneParams()
-        self.params.h_min = 0
-        self.params.h_max = 179
-        self.params.s_min = 0
-        self.params.s_max = 255
-        self.params.v_min = 0
-        self.params.v_max = 255
-        self.params.canny_low = 50
-        self.params.canny_high = 150
-        self.params.roi_height_percent = 60
-        self.params.warp_offset = 50
+        # Set initial values
+        for key, val in self.default_params.items():
+            setattr(self.params, key, val)
+
+        # Initialize OpenCV Window
+        self.window_name = "Lane Detection Dashboard"
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        # Increase window height to fit all images and text
+        cv2.resizeWindow(self.window_name, 500, 950)
+
+        # Create Trackbars
+        self.create_trackbars()
+
+    def create_trackbars(self):
+        def nothing(x):
+            pass
+            
+        # Create trackbars
+        # Reset Button as a Trackbar (Switch)
+        cv2.createTrackbar("Reset Params", self.window_name, 0, 1, nothing)
+        
+        cv2.createTrackbar("H Min", self.window_name, self.params.h_min, 179, nothing)
+        cv2.createTrackbar("H Max", self.window_name, self.params.h_max, 179, nothing)
+        cv2.createTrackbar("S Min", self.window_name, self.params.s_min, 255, nothing)
+        cv2.createTrackbar("S Max", self.window_name, self.params.s_max, 255, nothing)
+        cv2.createTrackbar("V Min", self.window_name, self.params.v_min, 255, nothing)
+        cv2.createTrackbar("V Max", self.window_name, self.params.v_max, 255, nothing)
+        cv2.createTrackbar("Canny Low", self.window_name, self.params.canny_low, 255, nothing)
+        cv2.createTrackbar("Canny High", self.window_name, self.params.canny_high, 255, nothing)
+        cv2.createTrackbar("ROI Height %", self.window_name, self.params.roi_height_percent, 100, nothing)
+        cv2.createTrackbar("Warp Offset", self.window_name, self.params.warp_offset, 200, nothing)
+
+    def reset_params(self):
+        self.get_logger().info("Resetting parameters to default")
+        for key, val in self.default_params.items():
+            setattr(self.params, key, val)
+            # Update trackbar positions
+            tb_name = key.replace('_', ' ').title().replace('H Min', 'H Min').replace('Roi', 'ROI')
+            mapping = {
+                'h_min': 'H Min', 'h_max': 'H Max',
+                's_min': 'S Min', 's_max': 'S Max',
+                'v_min': 'V Min', 'v_max': 'V Max',
+                'canny_low': 'Canny Low', 'canny_high': 'Canny High',
+                'roi_height_percent': 'ROI Height %', 'warp_offset': 'Warp Offset'
+            }
+            if key in mapping:
+                cv2.setTrackbarPos(mapping[key], self.window_name, val)
+        
+        # Reset the switch trackbar back to 0
+        cv2.setTrackbarPos("Reset Params", self.window_name, 0)
+        
+        self.pub_params.publish(self.params)
 
     def camera_callback(self, msg):
         try:
@@ -52,7 +101,12 @@ class GUINode(Node):
 
     def debug_callback(self, msg):
         try:
-            self.img_debug = self.cv_bridge.imgmsg_to_cv2(msg, "mono8")
+            # Debug image is now BGR (with boxes)
+            if msg.encoding == 'mono8':
+                self.img_debug = self.cv_bridge.imgmsg_to_cv2(msg, "mono8")
+                self.img_debug = cv2.cvtColor(self.img_debug, cv2.COLOR_GRAY2BGR)
+            else:
+                self.img_debug = self.cv_bridge.imgmsg_to_cv2(msg, "bgr8")
         except Exception:
             pass
 
@@ -62,160 +116,135 @@ class GUINode(Node):
         except Exception:
             pass
             
-    def publish_params(self):
-        self.pub_params.publish(self.params)
-
-
-class MainWindow(QMainWindow):
-    def __init__(self, ros_node):
-        super().__init__()
-        self.ros_node = ros_node
-        self.setWindowTitle("Lane Detection Dashboard")
-        self.setGeometry(100, 100, 1200, 800)
-        
-        # Main Layout
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        main_layout = QHBoxLayout(central_widget)
-        
-        # Left Side (Images)
-        left_layout = QVBoxLayout()
-        
-        self.label_camera = QLabel("Camera Input")
-        self.label_camera.setAlignment(Qt.AlignCenter)
-        self.label_camera.setMinimumSize(320, 240)
-        self.label_camera.setStyleSheet("border: 1px solid black; background-color: #ddd;")
-        
-        self.label_debug = QLabel("Processed (Bird's Eye)")
-        self.label_debug.setAlignment(Qt.AlignCenter)
-        self.label_debug.setMinimumSize(320, 240)
-        self.label_debug.setStyleSheet("border: 1px solid black; background-color: #ddd;")
-        
-        self.label_visual = QLabel("Visualized Output")
-        self.label_visual.setAlignment(Qt.AlignCenter)
-        self.label_visual.setMinimumSize(320, 240)
-        self.label_visual.setStyleSheet("border: 1px solid black; background-color: #ddd;")
-        
-        left_layout.addWidget(QLabel("<b>Original Camera</b>"))
-        left_layout.addWidget(self.label_camera)
-        left_layout.addWidget(QLabel("<b>Processed (Lane Mask)</b>"))
-        left_layout.addWidget(self.label_debug)
-        left_layout.addWidget(QLabel("<b>Final Visualization</b>"))
-        left_layout.addWidget(self.label_visual)
-        
-        # Right Side (Controls)
-        right_layout = QVBoxLayout()
-        
-        # HSV Controls
-        hsv_group = QGroupBox("HSV Thresholds")
-        hsv_layout = QGridLayout()
-        self.sliders = {}
-        
-        self.add_slider(hsv_layout, "H Min", 0, 179, 0, 0, "h_min")
-        self.add_slider(hsv_layout, "H Max", 0, 179, 179, 1, "h_max")
-        self.add_slider(hsv_layout, "S Min", 0, 255, 0, 2, "s_min")
-        self.add_slider(hsv_layout, "S Max", 0, 255, 255, 3, "s_max")
-        self.add_slider(hsv_layout, "V Min", 0, 255, 0, 4, "v_min")
-        self.add_slider(hsv_layout, "V Max", 0, 255, 255, 5, "v_max")
-        
-        hsv_group.setLayout(hsv_layout)
-        right_layout.addWidget(hsv_group)
-        
-        # Canny Controls
-        canny_group = QGroupBox("Canny Edge")
-        canny_layout = QGridLayout()
-        self.add_slider(canny_layout, "Low", 0, 255, 50, 0, "canny_low")
-        self.add_slider(canny_layout, "High", 0, 255, 150, 1, "canny_high")
-        canny_group.setLayout(canny_layout)
-        right_layout.addWidget(canny_group)
-        
-        # Geometry Controls
-        geo_group = QGroupBox("Geometry (ROI & Warp)")
-        geo_layout = QGridLayout()
-        self.add_slider(geo_layout, "ROI Height %", 0, 100, 60, 0, "roi_height_percent")
-        self.add_slider(geo_layout, "Warp Offset", 0, 200, 50, 1, "warp_offset")
-        geo_group.setLayout(geo_layout)
-        right_layout.addWidget(geo_group)
-        
-        right_layout.addStretch()
-        
-        # Add layouts to main
-        main_layout.addLayout(left_layout, 2) # Image area takes 2/3
-        main_layout.addLayout(right_layout, 1) # Control area takes 1/3
-        
-        # Timer for updating GUI images
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.update_images)
-        self.timer.start(30) # 30ms interval (~33 FPS)
-
-    def add_slider(self, layout, label, min_val, max_val, init_val, row, param_name):
-        lbl = QLabel(f"{label}: {init_val}")
-        slider = QSlider(Qt.Horizontal)
-        slider.setRange(min_val, max_val)
-        slider.setValue(init_val)
-        
-        # Callback with closure to capture specific slider/label
-        def value_changed(val):
-            lbl.setText(f"{label}: {val}")
-            setattr(self.ros_node.params, param_name, val)
-            self.ros_node.publish_params()
+    def lane_data_callback(self, msg):
+        self.current_lane_data = msg
             
-        slider.valueChanged.connect(value_changed)
-        
-        layout.addWidget(lbl, row, 0)
-        layout.addWidget(slider, row, 1)
-        
-        self.sliders[param_name] = slider
+    def update_params(self):
+        # Read trackbar positions
+        try:
+            if cv2.getWindowProperty(self.window_name, cv2.WND_PROP_VISIBLE) < 1:
+                return
 
-    def update_images(self):
-        # Update Camera Image
-        if self.ros_node.img_camera is not None:
-            self.display_image(self.ros_node.img_camera, self.label_camera)
-            
-        # Update Debug Image
-        if self.ros_node.img_debug is not None:
-            self.display_image(self.ros_node.img_debug, self.label_debug, is_mono=True)
-            
-        # Update Visual Image
-        if self.ros_node.img_visual is not None:
-            self.display_image(self.ros_node.img_visual, self.label_visual)
+            # Check Reset Switch
+            reset_val = cv2.getTrackbarPos("Reset Params", self.window_name)
+            if reset_val == 1:
+                self.reset_params()
+                return
 
-    def display_image(self, cv_img, label_widget, is_mono=False):
-        h, w = cv_img.shape[:2]
-        if is_mono:
-            bytes_per_line = w
-            q_img = QImage(cv_img.data, w, h, bytes_per_line, QImage.Format_Grayscale8)
+            self.params.h_min = cv2.getTrackbarPos("H Min", self.window_name)
+            self.params.h_max = cv2.getTrackbarPos("H Max", self.window_name)
+            self.params.s_min = cv2.getTrackbarPos("S Min", self.window_name)
+            self.params.s_max = cv2.getTrackbarPos("S Max", self.window_name)
+            self.params.v_min = cv2.getTrackbarPos("V Min", self.window_name)
+            self.params.v_max = cv2.getTrackbarPos("V Max", self.window_name)
+            self.params.canny_low = cv2.getTrackbarPos("Canny Low", self.window_name)
+            self.params.canny_high = cv2.getTrackbarPos("Canny High", self.window_name)
+            self.params.roi_height_percent = cv2.getTrackbarPos("ROI Height %", self.window_name)
+            self.params.warp_offset = cv2.getTrackbarPos("Warp Offset", self.window_name)
+            
+            self.pub_params.publish(self.params)
+        except cv2.error:
+            pass
+
+    def show_images(self):
+        # Create a canvas
+        # Height: 950, Width: 500
+        canvas_h = 950
+        canvas_w = 500
+        canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+        
+        # Define image size for display (e.g., 320x240)
+        disp_w, disp_h = 320, 240
+        
+        # Helper to resize and place image
+        def place_image(img, x, y, title):
+            if img is not None:
+                resized = cv2.resize(img, (disp_w, disp_h))
+                canvas[y:y+disp_h, x:x+disp_w] = resized
+            else:
+                # Placeholder
+                cv2.rectangle(canvas, (x, y), (x+disp_w, y+disp_h), (50, 50, 50), -1)
+                cv2.putText(canvas, "No Signal", (x+100, y+120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+            
+            # Draw border and title
+            cv2.rectangle(canvas, (x, y), (x+disp_w, y+disp_h), (255, 255, 255), 2)
+            cv2.putText(canvas, title, (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Center the images horizontally
+        x_left = 90
+        y_start = 40
+        gap = 30
+        
+        place_image(self.img_camera, x_left, y_start, "Original Camera")
+        place_image(self.img_debug, x_left, y_start + disp_h + gap, "Processed (Lane Mask)")
+        place_image(self.img_visual, x_left, y_start + (disp_h + gap) * 2, "Final Visualization")
+        
+        # Display Steering Angle at the bottom
+        y_text = y_start + (disp_h + gap) * 3 + 20
+        
+        if self.current_lane_data is not None and self.current_lane_data.lane_detected:
+            # Calculate Angle
+            # Assuming image height used in processor was 480 (standard VGA) or similar ratio
+            # We use the same logic as visualizer_node
+            # But we don't know the exact height used in processor here easily without image
+            # However, we can use a fixed reference or just display the raw value if needed
+            # Let's use a standard assumption or just display the curve_radius for now
+            # Better: Calculate angle assuming standard aspect ratio or use the value directly
+            
+            dx = self.current_lane_data.curve_radius
+            # Approximate dy as half of standard height (e.g. 240 if 480p)
+            # Or better, if we have img_camera, use its height
+            dy = 240.0 
+            if self.img_camera is not None:
+                dy = self.img_camera.shape[0] / 2.0
+            
+            angle_rad = math.atan2(dx, dy)
+            angle_deg = math.degrees(angle_rad)
+            
+            text = f"Steering Angle: {angle_deg:.1f} deg"
+            
+            # Center the text
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
+            tx = (canvas_w - tw) // 2
+            
+            # Color based on angle (Green: Straight, Red: Turn)
+            color = (0, 255, 0)
+            if abs(angle_deg) > 10:
+                color = (0, 165, 255) # Orange
+            if abs(angle_deg) > 20:
+                color = (0, 0, 255) # Red
+                
+            cv2.putText(canvas, text, (tx, y_text), cv2.FONT_HERSHEY_SIMPLEX, 1.2, color, 3)
         else:
-            bytes_per_line = 3 * w
-            # OpenCV is BGR, Qt is RGB
-            rgb_img = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-            q_img = QImage(rgb_img.data, w, h, bytes_per_line, QImage.Format_RGB888)
-            
-        pixmap = QPixmap.fromImage(q_img)
-        # Scale to fit label while keeping aspect ratio
-        scaled_pixmap = pixmap.scaled(label_widget.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        label_widget.setPixmap(scaled_pixmap)
+            text = "NO LANE DETECTED"
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)
+            tx = (canvas_w - tw) // 2
+            cv2.putText(canvas, text, (tx, y_text), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+        
+        cv2.imshow(self.window_name, canvas)
+
+        key = cv2.waitKey(1)
+        if key == 27: # ESC
+            rclpy.shutdown()
+        elif key == ord('r') or key == ord('R'):
+            self.reset_params()
 
 def main(args=None):
     rclpy.init(args=args)
-    
-    # Create ROS Node
-    gui_node = GUINode()
-    
-    # Run ROS node in a separate thread
-    thread = Thread(target=rclpy.spin, args=(gui_node,), daemon=True)
-    thread.start()
-    
-    # Create PyQt Application
-    app = QApplication(sys.argv)
-    window = MainWindow(gui_node)
-    window.show()
+    node = GUINode()
     
     try:
-        sys.exit(app.exec_())
+        while rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.01)
+            node.update_params()
+            node.show_images()
+    except KeyboardInterrupt:
+        pass
     finally:
-        gui_node.destroy_node()
-        rclpy.shutdown()
+        node.destroy_node()
+        cv2.destroyAllWindows()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

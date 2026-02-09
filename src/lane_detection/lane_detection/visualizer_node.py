@@ -5,6 +5,7 @@ from lane_msgs.msg import LaneData
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
+import math
 
 class VisualizerNode(Node):
     def __init__(self):
@@ -36,39 +37,51 @@ class VisualizerNode(Node):
         self.current_lane_data = msg
 
     def image_callback(self, msg):
-        """이미지를 받아서 화살표를 그리고 재발행합니다."""
+        """이미지를 받아서 텍스트 정보만 표시하고 재발행합니다."""
         try:
             # 1. ROS 이미지를 OpenCV 이미지로 변환
-            # 입력이 mono8(흑백)일 수 있으므로 컬러(BGR)로 변환해야 초록색을 그릴 수 있음
-            cv_image = self.cv_bridge.imgmsg_to_cv2(msg, "mono8")
-            color_image = cv2.cvtColor(cv_image, cv2.COLOR_GRAY2BGR)
+            if msg.encoding == 'mono8':
+                cv_image = self.cv_bridge.imgmsg_to_cv2(msg, "mono8")
+                color_image = cv2.cvtColor(cv_image, cv2.COLOR_GRAY2BGR)
+            else:
+                color_image = self.cv_bridge.imgmsg_to_cv2(msg, "bgr8")
+                
         except Exception as e:
             self.get_logger().error(f'Could not convert image: {e}')
             return
 
-        # 2. 화살표 그리기
-        if self.current_lane_data is not None:
+        # 2. 정보 표시
+        if self.current_lane_data is not None and self.current_lane_data.lane_detected:
             height, width = color_image.shape[:2]
             
-            # 화살표 시작점 (이미지 하단 중앙)
-            start_point = (int(width / 2), height)
+            # 각도 계산
+            # dx: 상단 중심점과 하단 중심점의 x좌표 차이 (픽셀)
+            dx = self.current_lane_data.curve_radius
+            # dy: 이미지 높이의 절반 (lane_processor에서 설정한 y좌표 차이)
+            dy = height / 2.0
             
-            # 화살표 끝점 계산
-            # lane_center는 -1.0(좌) ~ 1.0(우) 범위, 0.0이 중앙
-            # 화면 좌표계로 변환: (lane_center * 반너비) + 중앙값
-            center_offset = self.current_lane_data.lane_center * (width / 2)
-            end_x = int((width / 2) + center_offset)
-            end_y = int(height / 2) # 화면 중간까지만 화살표 그리기
-            
-            end_point = (end_x, end_y)
-            
-            # 초록색 화살표 그리기 (BGR: 0, 255, 0), 두께 5
-            cv2.arrowedLine(color_image, start_point, end_point, (0, 255, 0), 5, tipLength=0.1)
+            # 아크탄젠트로 각도 계산 (라디안 -> 도)
+            # dx가 양수(오른쪽)면 각도도 양수, 음수(왼쪽)면 각도도 음수
+            angle_rad = math.atan2(dx, dy)
+            angle_deg = math.degrees(angle_rad)
             
             # 텍스트 정보 표시
-            text = f"Center: {self.current_lane_data.lane_center:.2f}"
-            cv2.putText(color_image, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 
-                        0.7, (0, 255, 0), 2)
+            text_center = f"Center: {self.current_lane_data.lane_center:.2f}"
+            text_curve = f"Curve Val: {self.current_lane_data.curve_radius:.1f}"
+            text_angle = f"Angle: {angle_deg:.1f} deg"
+            
+            # 초록색 텍스트
+            cv2.putText(color_image, text_center, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(color_image, text_curve, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # 노란색 텍스트 (각도)
+            cv2.putText(color_image, text_angle, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        else:
+            height, width = color_image.shape[:2]
+            # 차선 미검출 시 빨간색 텍스트
+            cv2.putText(color_image, "NO LANE DETECTED", (50, int(height/2)), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
 
         # 3. 결과 이미지 발행
         visual_msg = self.cv_bridge.cv2_to_imgmsg(color_image, "bgr8")
