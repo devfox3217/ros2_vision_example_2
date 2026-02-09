@@ -11,7 +11,7 @@ class VisualizerNode(Node):
     def __init__(self):
         super().__init__('visualizer_node')
         
-        # 구독 (Subscribe)
+        # 구독자 (Subscribers)
         self.sub_image = self.create_subscription(
             Image,
             '/lane_debug_img',
@@ -24,7 +24,7 @@ class VisualizerNode(Node):
             self.data_callback,
             10)
             
-        # 발행 (Publish) - 시각화된 결과 이미지
+        # 발행자 (Publishers) - 시각화된 결과 이미지
         self.pub_visual = self.create_publisher(Image, '/lane_visual', 10)
         
         self.cv_bridge = CvBridge()
@@ -33,11 +33,11 @@ class VisualizerNode(Node):
         self.current_lane_data = None
 
     def data_callback(self, msg):
-        """최신 차선 데이터를 업데이트합니다."""
+        # 최신 차선 데이터를 업데이트합니다.
         self.current_lane_data = msg
 
     def image_callback(self, msg):
-        """이미지를 받아서 텍스트 정보만 표시하고 재발행합니다."""
+        # 이미지를 받아서 텍스트 정보만 표시하고 재발행합니다.
         try:
             # 1. ROS 이미지를 OpenCV 이미지로 변환
             if msg.encoding == 'mono8':
@@ -47,7 +47,7 @@ class VisualizerNode(Node):
                 color_image = self.cv_bridge.imgmsg_to_cv2(msg, "bgr8")
                 
         except Exception as e:
-            self.get_logger().error(f'Could not convert image: {e}')
+            self.get_logger().error(f'이미지 변환 실패: {e}')
             return
 
         # 2. 정보 표시
