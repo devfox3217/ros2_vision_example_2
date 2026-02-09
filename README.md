@@ -1,48 +1,51 @@
 # ROS2 Lane Detection System
 
-ROS2와 OpenCV를 활용한 차선 인식 및 조향각 계산 시스템입니다. Sliding Window 알고리즘을 적용하여 곡선 도로에서의 인식률을 높였으며, 실시간 튜닝이 가능한 GUI 대시보드를 제공합니다.
+## 1. 영상 데이터 처리 흐름
 
-## 🏗 시스템 구조 (Architecture)
+### 1.1. 입력 (Input)
+카메라에서 들어온 원본 데이터를 처리 가능한 형태로 변형합니다.
+- **Input**: `/camera_open` 토픽에서 수신
+- **Process**: 
+  - `cv_bridge`를 사용하여 ROS 이미지 메시지를 OpenCV(BGR) 포맷으로 변환
+  - 연산 속도를 위하여 이미지 리사이징 및 ROI 설정 (현재 코드에서는 파라미터로 상단 영역 Crop 수행)
+- **Data**: RAW Pixel Data (BGR)
 
-시스템은 크게 3개의 노드로 구성되어 있습니다.
+### 1.2. 처리 (Process)
+픽셀 데이터에서 ‘차선’ 이라고 부를 수 있는 특징점을 찾아냅니다.
+- **Preprocessing**: 
+  - 가우시안 블러(Gaussian Blur)로 고주파 노이즈 제거
+  - **HSV 색상 변환**을 통해 조명 변화에 강한 특징 추출 (흰색/노란색 차선 강조)
+- **Binarization**: 
+  - **HSV Thresholding**을 통해 차선은 흰색(1), 나머지는 검은색(0)으로 분리하는 마스크 생성
+- **Perspective Transform**: 
+  - **Bird's Eye View**로 변환하여 원근감을 제거하고 차선을 위에서 내려다보는 평면 좌표로 변환 (곡률 계산의 정확도 향상)
 
-### 1. Lane Processor (`lane_processor.py`)
-핵심 영상 처리 및 차선 위치 계산을 담당합니다.
-- **알고리즘**:
-  1. **Preprocessing**: Gaussian Blur & HSV Color Thresholding.
-  2. **Warping**: Perspective Transform을 통해 Bird's Eye View 생성.
-  3. **Sliding Window**: 히스토그램 분석 및 9개의 윈도우를 이용한 차선 픽셀 추적.
-  4. **Curve Fitting**: 2차 함수(`ax^2 + bx + c`) 피팅.
-- **Output**: 
-  - 차선 중심 위치 (`lane_center`)
-  - 곡률/회전량 (`curve_radius`)
-  - 디버깅 이미지 (Sliding Window 박스 시각화)
+### 1.3. 데이터 수치화 (Feature Extraction)
+이미지 상의 흰색 점들을 제어에 쓸 수 있는 수학적 정보로 추출합니다.
+- **Sliding Window Algorithm**:
+  - 히스토그램 분석으로 차선 시작점 탐색
+  - 9개의 윈도우를 이용하여 곡선 도로에서도 차선 픽셀을 놓치지 않고 추적
+  - **Parameters**: `sw_margin`(검색 너비), `sw_minpix`(최소 픽셀 수)를 조절하여 민감도 튜닝 가능
+- **Curve Fitting**:
+  - 추적된 픽셀들을 2차 함수($x = ay^2 + by + c$)로 피팅하여 차선의 곡률 모델링
+- **Calculation**:
+  - `lane_center`: 화면 중앙 대비 차선 중심의 편차 계산 (-1.0 ~ 1.0)
+  - `curve_radius`: 상단 중심점과 하단 중심점의 차이를 이용해 조향각(Steering Angle) 계산
 
-### 2. GUI Node (`gui_node.py`)
-사용자 제어 패널 및 통합 모니터링 대시보드입니다.
-- **기능**:
-  - **3단 뷰어**: 원본 영상, 처리 영상(Sliding Window), 최종 시각화 영상을 한눈에 확인.
-  - **Parameter Tuning**: HSV 값, ROI, Canny Edge 등 파라미터를 실시간 조절 (Trackbar).
-  - **Steering Angle**: 계산된 조향각을 하단에 큰 텍스트로 표시 (직진/회전 상태에 따라 색상 변경).
-  - **Reset**: 파라미터 초기화 기능 제공.
+### 1.4. ROS2 메시지 정의 및 발행
+가공된 정보를 다음 노드(판단/제어 노드)가 쓸 수 있도록 구조화하여 보냅니다.
+- **Custom Message (`LaneData.msg`)**: 
+  - 단순히 이미지를 다시 보내는 것이 아니라, 수치 데이터를 보냅니다.
+  - `float32 lane_center`: 차선 중심 편차
+  - `float32 curve_radius`: 조향각 계산을 위한 픽셀 차이 값
+  - `bool lane_detected`: 차선 검출 여부
+- **Publisher**: 
+  - `lane_processor` 노드가 위 데이터를 담아 `/lane_data` 토픽으로 발행
+  - 이후 `gui_node`나 `visualizer_node`가 이 토픽을 구독하여 시각화 및 제어에 사용
 
-### 3. Visualizer Node (`visualizer_node.py`)
-데이터 시각화 및 정보 오버레이를 담당합니다.
-- **기능**:
-  - 처리된 이미지 위에 수치 데이터(Center, Curve, Angle) 텍스트 표시.
-  - 차선 미검출 시 경고 메시지 출력.
+---
 
-## 📡 데이터 흐름 (Data Flow)
-
-| Topic Name | Type | Description | Publisher | Subscriber |
-|------------|------|-------------|-----------|------------|
-| `/camera_open` | `sensor_msgs/Image` | 원본 카메라 영상 | Camera Node | Processor, GUI |
-| `/lane_params` | `lane_msgs/LaneParams` | 튜닝 파라미터 | GUI | Processor |
-| `/lane_data` | `lane_msgs/LaneData` | 계산된 차선 정보 | Processor | GUI, Visualizer |
-| `/lane_debug_img` | `sensor_msgs/Image` | Sliding Window 처리 영상 | Processor | GUI, Visualizer |
-| `/lane_visual` | `sensor_msgs/Image` | 최종 정보 오버레이 영상 | Visualizer | GUI |
-
-## 🚀 사용 방법 (Usage)
+## 2. 시스템 실행 방법
 
 1. **빌드**:
    ```bash
@@ -51,7 +54,6 @@ ROS2와 OpenCV를 활용한 차선 인식 및 조향각 계산 시스템입니�
    ```
 
 2. **실행**:
-   각 노드를 별도의 터미널에서 실행하거나 launch 파일을 사용합니다.
    ```bash
    # 1. 차선 처리 노드
    ros2 run lane_detection lane_processor
@@ -59,35 +61,25 @@ ROS2와 OpenCV를 활용한 차선 인식 및 조향각 계산 시스템입니�
    # 2. 시각화 노드
    ros2 run lane_detection visualizer_node
    
-   # 3. GUI 대시보드 (최종 확인용)
+   # 3. GUI 대시보드
    ros2 run lane_detection gui_node
    ```
 
-## ⚙️ 파라미터 상세 가이드 (Parameter Tuning Guide)
+## 3. 파라미터 튜닝 가이드 (GUI)
 
 GUI 대시보드의 Trackbar를 사용하여 다음 값들을 실시간으로 조절할 수 있습니다.
 
-### 🎨 색상 필터링 (HSV)
-차선의 색상을 정확하게 추출하기 위한 설정입니다.
-- **H Min / H Max (Hue)**: 색상(색조)의 범위를 지정합니다.
-  - *Tip*: 흰색 차선은 색조의 영향이 적으므로 범위를 넓게(0~180) 잡아도 되지만, 노란색 차선은 특정 범위(20~30 등)로 좁혀야 합니다.
-- **S Min / S Max (Saturation)**: 채도(색의 선명도) 범위를 지정합니다.
-  - *Tip*: 흰색은 채도가 매우 낮으므로 `S Max`를 낮게(예: 50 이하) 설정하면 흰색만 잘 걸러낼 수 있습니다.
-- **V Min / V Max (Value)**: 명도(밝기) 범위를 지정합니다.
-  - *Tip*: 그림자나 어두운 도로 바닥을 제외하고 밝은 차선만 남기려면 `V Min`을 높게(예: 200 이상) 설정하세요.
-
-### 📐 영역 및 변환 (Geometry)
-- **ROI Height %**: 관심 영역(Region of Interest)의 높이 비율입니다.
-  - *설명*: 이미지의 위쪽(하늘, 먼 배경)을 얼마나 잘라낼지 결정합니다. 값이 60이면 위에서 40%를 자르고 아래 60%만 사용합니다.
-- **Warp Offset**: Bird's Eye View 변환 시 좌우 여백을 조절합니다.
-  - *설명*: 이 값이 클수록 변환된 이미지에서 도로가 더 좁게(멀리) 보이고, 작을수록 더 넓게 보입니다. 차선이 평행하게 보이도록 조절하세요.
-
-### 🔍 기타
-- **Canny Low / High**: (현재 로직에서는 HSV가 주력이므로 보조적 역할) 엣지 검출의 민감도를 조절합니다.
+### 🛠️ 일반 설정
+- **Debug View**: 이미지 처리 및 시각화 기능을 켜고 끕니다. (OFF 시 연산 부하 감소)
 - **Reset Params**: 모든 설정을 초기 기본값으로 되돌립니다.
 
-## 📐 조향각 계산 (Steering Angle)
+### 🎨 색상 필터링 (HSV)
+- **H/S/V Min/Max**: 차선 색상(흰색/노란색)을 배경과 분리하기 위한 임계값 조절
 
-- **원리**: Bird's Eye View 상에서 차선의 상단 중심점($x_{top}$)과 하단 중심점($x_{bottom}$)의 차이를 이용합니다.
-- **공식**: $\theta = \arctan(\frac{x_{top} - x_{bottom}}{height/2})$
-- **표시**: GUI 하단에 각도(deg)로 표시되며, 0도에 가까울수록 직진, 값이 커질수록 회전이 필요함을 의미합니다.
+### 📐 영역 및 변환 (Geometry)
+- **ROI Height %**: 불필요한 상단 배경(하늘 등)을 제거하는 비율
+- **Warp Offset**: Bird's Eye View 변환 시 도로 폭 조절
+
+### 🔍 Sliding Window 설정
+- **SW Margin**: 윈도우의 좌우 검색 너비 (값이 클수록 휘어진 차선을 잘 찾지만 잡음에 취약)
+- **SW MinPix**: 윈도우 이동을 위한 최소 픽셀 수 (값이 클수록 노이즈에 강함)

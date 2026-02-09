@@ -37,15 +37,18 @@ class LaneProcessor(Node):
         self.params.s_max = 50
         self.params.v_min = 200
         self.params.v_max = 255
-        self.params.canny_low = 50
-        self.params.canny_high = 150
         self.params.roi_height_percent = 60
         self.params.warp_offset = 150
+        self.params.sw_margin = 100
+        self.params.sw_minpix = 50
+        self.params.debug_view = 1 # Default ON
 
     def params_callback(self, msg):
+        """파라미터 노드로부터 업데이트된 설정값을 받습니다."""
         self.params = msg
 
     def image_callback(self, msg):
+        """영상을 수신하여 차선 인식을 수행합니다."""
         try:
             frame = self.cv_bridge.imgmsg_to_cv2(msg, "bgr8")
         except Exception as e:
@@ -58,25 +61,24 @@ class LaneProcessor(Node):
         # 데이터 발행
         self.publisher_lane_data.publish(lane_data)
         
-        # 디버깅 이미지 발행
-        if processed_frame is not None:
-            # processed_frame은 이제 BGR 컬러 이미지입니다 (박스가 그려진)
+        # 디버깅 이미지 발행 (옵션)
+        if self.params.debug_view == 1 and processed_frame is not None:
             debug_msg = self.cv_bridge.cv2_to_imgmsg(processed_frame, "bgr8")
             self.publisher_debug_img.publish(debug_msg)
 
     def process_lane(self, frame):
         height, width = frame.shape[:2]
         
-        # 1. Preprocessing
+        # 1. Preprocessing (Blur)
         blur = cv2.GaussianBlur(frame, (5, 5), 0)
         
-        # 2. Color Thresholding
+        # 2. Color Thresholding (HSV)
         hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
         lower = np.array([self.params.h_min, self.params.s_min, self.params.v_min])
         upper = np.array([self.params.h_max, self.params.s_max, self.params.v_max])
         mask = cv2.inRange(hsv, lower, upper)
         
-        # 3. ROI
+        # 3. ROI (Region of Interest)
         roi_h = int(height * (self.params.roi_height_percent / 100.0))
         roi_mask = np.zeros_like(mask)
         if roi_h < height:
@@ -102,16 +104,18 @@ class LaneProcessor(Node):
         M = cv2.getPerspectiveTransform(src_pts, dst_pts)
         warped = cv2.warpPerspective(roi_mask, M, (width, height))
         
-        # 시각화를 위해 흑백 -> 컬러 변환
-        out_img = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
+        # 디버그 뷰가 꺼져있으면 여기서 이미지 생성 중단하고 데이터 계산만 수행할 수도 있지만,
+        # Sliding Window를 위해 warped 이미지는 필요함.
+        # 단, out_img(컬러 변환 및 박스 그리기)는 디버그 뷰가 켜져있을 때만 수행하여 최적화 가능.
         
         # 5. Sliding Window Search
         histogram = np.sum(warped[warped.shape[0]//2:, :], axis=0)
         
+        # 히스토그램이 비어있는 경우
         if np.max(histogram) == 0:
             lane_data = LaneData()
             lane_data.lane_detected = False
-            return out_img, lane_data
+            return None, lane_data
 
         midpoint = int(histogram.shape[0] / 2)
         leftx_base = np.argmax(histogram[:midpoint])
@@ -126,11 +130,16 @@ class LaneProcessor(Node):
         leftx_current = leftx_base
         rightx_current = rightx_base
         
-        margin = 100
-        minpix = 50
+        margin = self.params.sw_margin
+        minpix = self.params.sw_minpix
         
         left_lane_inds = []
         right_lane_inds = []
+        
+        # 디버그 이미지가 필요할 때만 생성
+        out_img = None
+        if self.params.debug_view == 1:
+            out_img = cv2.cvtColor(warped, cv2.COLOR_GRAY2BGR)
         
         for window in range(nwindows):
             win_y_low = height - (window + 1) * window_height
@@ -141,9 +150,10 @@ class LaneProcessor(Node):
             win_xright_low = rightx_current - margin
             win_xright_high = rightx_current + margin
             
-            # 박스 그리기 (Sliding Window 시각화)
-            cv2.rectangle(out_img, (win_xleft_low, win_y_low), (win_xleft_high, win_y_high), (0, 255, 0), 2)
-            cv2.rectangle(out_img, (win_xright_low, win_y_low), (win_xright_high, win_y_high), (0, 255, 0), 2)
+            # 박스 그리기 (디버그 뷰 ON일 때만)
+            if self.params.debug_view == 1:
+                cv2.rectangle(out_img, (win_xleft_low, win_y_low), (win_xleft_high, win_y_high), (0, 255, 0), 2)
+                cv2.rectangle(out_img, (win_xright_low, win_y_low), (win_xright_high, win_y_high), (0, 255, 0), 2)
             
             good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
                               (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
@@ -173,10 +183,7 @@ class LaneProcessor(Node):
         if len(leftx) > 0 and len(rightx) > 0:
             lane_detected = True
             
-            # 차선 픽셀 색칠 (왼쪽: 빨강, 오른쪽: 파랑)
-            out_img[lefty, leftx] = [0, 0, 255]
-            out_img[righty, rightx] = [255, 0, 0]
-            
+            # 2차 함수 피팅
             left_fit = np.polyfit(lefty, leftx, 2)
             right_fit = np.polyfit(righty, rightx, 2)
             
@@ -198,9 +205,12 @@ class LaneProcessor(Node):
             curve_val = (lane_center_px_top - lane_center_px)
             curve_radius = float(curve_val)
             
-            # 추정된 차선 중심선 그리기 (노란색)
-            cv2.line(out_img, (int(lane_center_px), int(y_eval)), 
-                     (int(lane_center_px_top), int(y_eval_top)), (0, 255, 255), 2)
+            # 시각화 (디버그 뷰 ON일 때만)
+            if self.params.debug_view == 1:
+                out_img[lefty, leftx] = [0, 0, 255]
+                out_img[righty, rightx] = [255, 0, 0]
+                cv2.line(out_img, (int(lane_center_px), int(y_eval)), 
+                         (int(lane_center_px_top), int(y_eval_top)), (0, 255, 255), 2)
 
         lane_data = LaneData()
         lane_data.lane_center = float(lane_center_norm)
