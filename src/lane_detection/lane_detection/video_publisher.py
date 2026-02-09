@@ -16,7 +16,8 @@ class VideoPublisher(Node):
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=1
         )
-        
+
+
         # Topic Name: /camera_open
         self.publisher_ = self.create_publisher(Image, '/camera_open', qos_profile)
         
